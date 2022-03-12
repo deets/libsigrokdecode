@@ -69,10 +69,8 @@ class Decoder(srd.Decoder):
         self.blocklen = 0
         self.read_buf = []
         self.cmd_str = ''
-        self.is_cmd24 = False
-        self.cmd24_start_token_found = False
-        self.is_cmd17 = False
-        self.cmd17_start_token_found = False
+        self.current_cmd = None
+        self.cmd_start_token_found = False
         self.busy_first_byte = False
 
     def start(self):
@@ -226,13 +224,13 @@ class Decoder(srd.Decoder):
     def handle_cmd17(self):
         # CMD17: READ_SINGLE_BLOCK
         self.putc(Ann.CMD17, 'Read a block from address 0x%04x' % self.arg)
-        self.is_cmd17 = True
+        self.current_cmd = Ann.CMD17
         self.state = 'GET RESPONSE R1'
 
     def handle_cmd24(self):
         # CMD24: WRITE_BLOCK
         self.putc(Ann.CMD24, 'Write a block to address 0x%04x' % self.arg)
-        self.is_cmd24 = True
+        self.current_cmd = Ann.CMD24
         self.state = 'GET RESPONSE R1'
 
     def handle_cmd49(self):
@@ -339,9 +337,9 @@ class Decoder(srd.Decoder):
         # Bit 7: Always set to 0
         putbit(7, ['Bit 7 (always 0)'])
 
-        if self.is_cmd17:
+        if self.current_cmd == Ann.CMD17:
             self.state = 'HANDLE DATA BLOCK CMD17'
-        if self.is_cmd24:
+        if self.current_cmd == Ann.CMD24:
             self.state = 'HANDLE DATA BLOCK CMD24'
 
     def handle_response_r1b(self, res):
@@ -368,7 +366,7 @@ class Decoder(srd.Decoder):
         # CMD17 returns one byte R1, then some bytes 0xff, then a Start Block
         # (single byte 0xfe), then self.blocklen bytes of data, then always
         # 2 bytes of CRC.
-        if self.cmd17_start_token_found:
+        if self.cmd_start_token_found:
             if len(self.read_buf) == 0:
                 self.ss_data = self.ss
                 if not self.blocklen:
@@ -392,11 +390,10 @@ class Decoder(srd.Decoder):
                 self.state = 'IDLE'
         elif miso == TOKEN_BLOCK_START:
             self.put(self.ss, self.es, self.out_ann, [Ann.CMD17, ['Start Block']])
-            self.cmd17_start_token_found = True
-
+            self.cmd_start_token_found = True
 
     def handle_data_cmd24(self, mosi):
-        if self.cmd24_start_token_found:
+        if self.cmd_start_token_found:
             if len(self.read_buf) == 0:
                 self.ss_data = self.ss
                 if not self.blocklen:
@@ -415,7 +412,7 @@ class Decoder(srd.Decoder):
             self.state = 'DATA RESPONSE'
         elif mosi == TOKEN_BLOCK_START:
             self.put(self.ss, self.es, self.out_ann, [Ann.CMD24, ['Start Block']])
-            self.cmd24_start_token_found = True
+            self.cmd_start_token_found = True
 
     def handle_data_response(self, miso):
         # Data Response token (1 byte).
@@ -443,10 +440,10 @@ class Decoder(srd.Decoder):
         elif miso == 0x0d:
             self.put(m[3][1], m[1][2], self.out_ann, [Ann.BIT, ['Data rejected (write error)']])
         self.put(m[0][1], m[0][2], self.out_ann, [Ann.BIT, ['Always 1']])
-        cls = Ann.CMD24 if self.is_cmd24 else None
+        cls = self.current_cmd
         if cls is not None:
             self.put(self.ss, self.es, self.out_ann, [cls, ['Data Response']])
-        if self.is_cmd24:
+        if cls == Ann.CMD24:
             # We just send a block of data to be written to the card,
             # this takes some time.
             self.state = 'WAIT WHILE CARD BUSY'
@@ -456,7 +453,7 @@ class Decoder(srd.Decoder):
 
     def wait_while_busy(self, miso):
         if miso != 0x00:
-            cls = Ann.CMD24 if self.is_cmd24 else None
+            cls = self.current_cmd
             if cls is not None:
                 self.put(self.ss_busy, self.es_busy, self.out_ann, [cls, ['Card is busy']])
             self.state = 'IDLE'
