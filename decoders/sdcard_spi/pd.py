@@ -410,6 +410,8 @@ class Decoder(srd.Decoder):
             self.put(self.ss_data, self.es_data, self.out_ann, [Ann.CMD24, ['Block data: %s' % self.read_buf]])
             self.read_buf = []
             self.state = 'DATA RESPONSE'
+            self.cmd_start_token_found = False
+
         elif mosi == TOKEN_BLOCK_START:
             self.put(self.ss, self.es, self.out_ann, [Ann.CMD24, ['Start Block']])
             self.cmd_start_token_found = True
