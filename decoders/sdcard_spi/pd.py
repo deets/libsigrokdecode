@@ -27,6 +27,11 @@ a = ['CMD%d' % i for i in range(64)] + ['ACMD%d' % i for i in range(64)] + \
     ['R' + r.upper() for r in responses] + ['BIT', 'BIT_WARNING']
 Ann = SrdIntEnum.from_list('Ann', a)
 
+TOKEN_BLOCK_START_WRITE_MULTI = 0xFC
+TOKEN_BLOCK_STOP_WRITE_MULTI = 0xFD
+TOKEN_BLOCK_START = 0xFE
+
+
 class Decoder(srd.Decoder):
     api_version = 3
     id = 'sdcard_spi'
@@ -385,9 +390,10 @@ class Decoder(srd.Decoder):
                 # TODO: Check CRC.
                 self.put(self.ss_crc, self.es_crc, self.out_ann, [Ann.CMD17, ['CRC']])
                 self.state = 'IDLE'
-        elif miso == 0xfe:
+        elif miso == TOKEN_BLOCK_START:
             self.put(self.ss, self.es, self.out_ann, [Ann.CMD17, ['Start Block']])
             self.cmd17_start_token_found = True
+
 
     def handle_data_cmd24(self, mosi):
         if self.cmd24_start_token_found:
@@ -407,7 +413,7 @@ class Decoder(srd.Decoder):
             self.put(self.ss_data, self.es_data, self.out_ann, [Ann.CMD24, ['Block data: %s' % self.read_buf]])
             self.read_buf = []
             self.state = 'DATA RESPONSE'
-        elif mosi == 0xfe:
+        elif mosi == TOKEN_BLOCK_START:
             self.put(self.ss, self.es, self.out_ann, [Ann.CMD24, ['Start Block']])
             self.cmd24_start_token_found = True
 
