@@ -27,6 +27,12 @@ a = ['CMD%d' % i for i in range(64)] + ['ACMD%d' % i for i in range(64)] + \
     ['R' + r.upper() for r in responses] + ['BIT', 'BIT_WARNING']
 Ann = SrdIntEnum.from_list('Ann', a)
 
+BLOCKSIZE = 512
+CMD25_WAIT_FOR_TOKEN = "CMD25_WAIT_FOR_TOKEN"
+CMD25_BLOCKDATA = "CMD25_BLOCKDATA"
+CMD25_HANDLE_RESPONSE = "CMD25_HANDLE_RESPONSE"
+CMD25_SKIP_BYTE = "CMD25_SKIP_BYTE"
+CMD25_BUSY_WAIT = "CMD25_BUSY_WAIT"
 TOKEN_BLOCK_START_WRITE_MULTI = 0xFC
 TOKEN_BLOCK_STOP_WRITE_MULTI = 0xFD
 TOKEN_BLOCK_START = 0xFE
@@ -72,6 +78,8 @@ class Decoder(srd.Decoder):
         self.current_cmd = None
         self.cmd_start_token_found = False
         self.busy_first_byte = False
+        self.cmd25_state = None
+        self.cmd25_transaction_complete = False
 
     def start(self):
         self.out_ann = self.register(srd.OUTPUT_ANN)
@@ -163,7 +171,7 @@ class Decoder(srd.Decoder):
             self.putb([Ann.BIT_WARNING, ['End bit: %d (Warning: Must be 1!)' % bit]])
 
         # Handle command.
-        if cmd in (0, 1, 9, 16, 17, 24, 41, 49, 55, 59):
+        if cmd in (0, 1, 9, 16, 17, 24, 25, 41, 49, 55, 59):
             self.state = 'HANDLE CMD%d' % cmd
             self.cmd_str = '%s%d (%s)' % (s, cmd, self.cmd_name(cmd))
         else:
@@ -231,6 +239,14 @@ class Decoder(srd.Decoder):
         # CMD24: WRITE_BLOCK
         self.putc(Ann.CMD24, 'Write a block to address 0x%04x' % self.arg)
         self.current_cmd = Ann.CMD24
+        self.state = 'GET RESPONSE R1'
+
+    def handle_cmd25(self):
+        # CMD25: WRITE_MULTIPLE_BLOCK
+        self.putc(Ann.CMD25, 'Write blocks starting at address 0x%04x' % self.arg)
+        self.current_cmd = Ann.CMD25
+        self.cmd25_state = CMD25_WAIT_FOR_TOKEN
+        self.cmd25_transaction_complete = False
         self.state = 'GET RESPONSE R1'
 
     def handle_cmd49(self):
@@ -337,10 +353,8 @@ class Decoder(srd.Decoder):
         # Bit 7: Always set to 0
         putbit(7, ['Bit 7 (always 0)'])
 
-        if self.current_cmd == Ann.CMD17:
-            self.state = 'HANDLE DATA BLOCK CMD17'
-        if self.current_cmd == Ann.CMD24:
-            self.state = 'HANDLE DATA BLOCK CMD24'
+        if self.current_cmd in (Ann.CMD17, Ann.CMD24, Ann.CMD25):
+            self.state = 'HANDLE DATA BLOCK CMD%s' % self.current_cmd.value
 
     def handle_response_r1b(self, res):
         # TODO
@@ -373,7 +387,7 @@ class Decoder(srd.Decoder):
                     # Assume a fixed block size when inspection of the previous
                     # traffic did not provide the respective parameter value.
                     # TODO: Make the default block size a PD option?
-                    self.blocklen = 512
+                    self.blocklen = BLOCKSIZE
             self.read_buf.append(miso)
             # Wait until block transfer completed.
             if len(self.read_buf) < self.blocklen:
@@ -404,7 +418,7 @@ class Decoder(srd.Decoder):
                     # previous traffic did not provide the respective
                     # parameter value.
                     # TODO Make the default block size a user adjustable option?
-                    self.blocklen = 512
+                    self.blocklen = BLOCKSIZE
             self.read_buf.append(mosi)
             # Wait until block transfer completed.
             if len(self.read_buf) < self.blocklen:
@@ -418,6 +432,94 @@ class Decoder(srd.Decoder):
         elif mosi == TOKEN_BLOCK_START:
             self.put(self.ss, self.es, self.out_ann, [Ann.CMD24, ['Start Block']])
             self.cmd_start_token_found = True
+
+    def handle_data_cmd25(self, mosi, miso):
+        if self.cmd25_state == CMD25_WAIT_FOR_TOKEN:
+            # we wait for the data to flow
+            if mosi == TOKEN_BLOCK_START_WRITE_MULTI:
+                self.cmd25_state = CMD25_BLOCKDATA
+                self.put(self.ss, self.es, self.out_ann, [25, ['Start Block Token']])
+                self.ss_data = self.ss
+            elif mosi == TOKEN_BLOCK_STOP_WRITE_MULTI:
+                self.cmd25_state = CMD25_SKIP_BYTE
+                self.ss_data = self.ss
+                self.cmd25_transaction_complete = True
+
+        elif self.cmd25_state == CMD25_SKIP_BYTE:
+            self.cmd25_state = CMD25_BUSY_WAIT
+            if self.cmd25_transaction_complete:
+                self.put(self.ss_data, self.es, self.out_ann, [25, ['Stop Transaction Token']])
+
+        elif self.cmd25_state == CMD25_BLOCKDATA:
+            self.read_buf.append(mosi)
+            if len(self.read_buf) == BLOCKSIZE:
+                self.es_data = self.es
+                self.put(self.ss_data, self.es_data, self.out_ann, [25, ['Block data: %s' % self.read_buf]])
+                self.read_buf = []
+                self.cmd25_state = CMD25_HANDLE_RESPONSE
+
+        elif self.cmd25_state == CMD25_HANDLE_RESPONSE:
+            # This is a replication of handle_data_response
+            # While this is regrettable, I believe managing
+            # the state machine to intertwine the existing
+            # R1 response decoding with the repeated CMD25
+            # block responses is not worth forcing DRY.
+            #
+            # The response consists of three bytes:
+            # Two CRC bytes sent by the host, and
+            # the result byte.
+            if len(self.read_buf) == 0:
+                self.read_buf.append(mosi)
+                self.ss_data = self.ss
+                return
+            elif len(self.read_buf) == 1:
+                self.read_buf.append(mosi)
+                self.es_data = self.es
+                return
+            # Print out the CRC so far and then analyse the
+            # final byte.
+            self.put(
+                self.ss_data,
+                self.es,
+                self.out_ann, [25, ['CRC: 0x%01x0x%01x' % (self.read_buf[0], self.read_buf[1])]]
+            )
+            self.read_buf = []
+            # Data Response token (1 byte).
+            #
+            # Format:
+            #  - Bits[7:5]: Don't care.
+            #  - Bits[4:4]: Always 0.
+            #  - Bits[3:1]: Status.
+            #    - 010: Data accepted.
+            #    - 101: Data rejected due to a CRC error.
+            #    - 110: Data rejected due to a write error.
+            #  - Bits[0:0]: Always 1.
+            miso &= 0x1f
+            if miso & 0x11 != 0x01:
+                # This is not the byte we are waiting for.
+                # Should we return to IDLE here?
+                return
+            m = self.miso_bits
+            self.put(m[7][1], m[5][2], self.out_ann, [Ann.BIT, ['Don\'t care']])
+            self.put(m[4][1], m[4][2], self.out_ann, [Ann.BIT, ['Always 0']])
+            if miso == 0x05:
+                self.put(m[3][1], m[1][2], self.out_ann, [Ann.BIT, ['Data accepted']])
+            elif miso == 0x0b:
+                self.put(m[3][1], m[1][2], self.out_ann, [Ann.BIT, ['Data rejected (CRC error)']])
+            elif miso == 0x0d:
+                self.put(m[3][1], m[1][2], self.out_ann, [Ann.BIT, ['Data rejected (write error)']])
+            self.put(m[0][1], m[0][2], self.out_ann, [Ann.BIT, ['Always 1']])
+            self.put(self.ss, self.es, self.out_ann, [Ann.CMD25, ['Data Response']])
+            self.cmd25_state = CMD25_BUSY_WAIT
+
+        elif self.cmd25_state == CMD25_BUSY_WAIT:
+            if miso == 0:
+                return
+            if self.cmd25_transaction_complete:
+                self.cmd25_state = None
+                self.state = "IDLE"
+            else:
+                self.cmd25_state = CMD25_WAIT_FOR_TOKEN
 
     def handle_data_response(self, miso):
         # Data Response token (1 byte).
@@ -520,6 +622,8 @@ class Decoder(srd.Decoder):
             self.handle_data_cmd17(miso)
         elif self.state == 'HANDLE DATA BLOCK CMD24':
             self.handle_data_cmd24(mosi)
+        elif self.state == 'HANDLE DATA BLOCK CMD25':
+            self.handle_data_cmd25(mosi, miso)
         elif self.state == 'DATA RESPONSE':
             self.handle_data_response(miso)
         elif self.state == 'WAIT WHILE CARD BUSY':
